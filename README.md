@@ -1,8 +1,8 @@
 # chatgpt-register-sub2api
 
-ChatGPT 账号自动注册 → K12 母号加入 → Sub2API JSON 导出，一条龙自动化工具。
+ChatGPT 账号注册 → K12 母号加入 → Sub2API JSON 导出，一条龙工具。
 
-从 [chatgpt2api](https://github.com/basketikun/chatgpt2api) 提取注册机核心逻辑，融合 workspace 加入和 sub2api 格式转换。
+从 [chatgpt2api](https://github.com/basketikun/chatgpt2api) 融合 workspace 加入和 sub2api 格式转换。
 
 ## 安装
 
@@ -105,9 +105,7 @@ email----password----client_id----refresh_token
 ## 注意事项
 
 - 建议使用代理，同一 IP 注册超过 3 个号容易触发风控
-- curl_cffi 需要 TLS 指纹伪装，这是绕过 OpenAI 反爬的关键
+- curl_cffi 需要 TLS 指纹伪装
 - Team 空间重新登录步骤需要实际 OpenAI 环境调试确认 workspace 选择 API
 
-## 致谢
 
-感谢 [LINUX DO](https://linux.do/) 社区的交流与支持。
