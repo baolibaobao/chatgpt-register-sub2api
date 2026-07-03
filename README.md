@@ -1,6 +1,5 @@
 # chatgpt-register-sub2api
-
-ChatGPT 账号注册 → K12 母号加入 → Sub2API JSON 导出，一条龙工具。
+。
 
 从 [chatgpt2api](https://github.com/basketikun/chatgpt2api) 融合 workspace 加入和 sub2api 格式转换。
 
@@ -36,7 +35,7 @@ chatgpt-register run -n 10 -v
 | 命令 | 说明 |
 |------|------|
 | `init` | 生成默认 config.yaml |
-| `register` | 只注册 ChatGPT 账号 |
+| `register` | 只注册 账号 |
 | `join-workspace` | 只执行 workspace 加入 |
 | `login-team` | 只执行重新登录（team 空间） |
 | `export` | 只导出 sub2api JSON |
