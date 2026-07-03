@@ -417,15 +417,22 @@ def run_full_pipeline(
     new_accounts = run_register(config, af, count=count)
     if not new_accounts:
         logger.error("No accounts registered — pipeline aborted")
-        return {"registered": 0, "joined": 0, "refreshed": 0, "exported": 0}
+        return {
+            "registered": 0,
+            "joined": 0,
+            "refreshed": 0,
+            "exported": 0,
+            "accounts_file": str(af),
+            "output_file": str(of) if of else "",
+        }
 
     # Stage 2: Join workspace
     joined_accounts = run_join_workspace(config, new_accounts)
-    save_accounts(af, joined_accounts)
+    save_accounts(af, merge_accounts(load_accounts(af), joined_accounts))
 
     # Stage 3: Refresh tokens + enrich with workspace info from check API
     refreshed_accounts = run_refresh_tokens(config, joined_accounts)
-    save_accounts(af, refreshed_accounts)
+    save_accounts(af, merge_accounts(load_accounts(af), refreshed_accounts))
 
     # Stage 4: Export (uses plan_type and account_id from check API)
     all_accounts = load_accounts(af)

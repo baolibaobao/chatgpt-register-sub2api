@@ -33,7 +33,7 @@ STATE_FILE = DATA_DIR / "outlook_token_state.json"
 
 OUTLOOK_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 OUTLOOK_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
-OUTLOOK_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
+OUTLOOK_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 OUTLOOK_IMAP_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
 OUTLOOK_DEFAULT_IMAP_HOST = "outlook.office365.com"
 
@@ -332,6 +332,10 @@ class OutlookTokenProvider(BaseMailProvider):
         self.mode = str(entry.get("mode") or "graph").strip().lower() or "graph"
         if self.mode not in {"graph", "imap", "auto"}:
             self.mode = "graph"
+        self.graph_scope = (
+            str(entry.get("graph_scope") or OUTLOOK_GRAPH_SCOPE).strip()
+            or OUTLOOK_GRAPH_SCOPE
+        )
         self.imap_host = (
             str(entry.get("imap_host") or OUTLOOK_DEFAULT_IMAP_HOST).strip()
             or OUTLOOK_DEFAULT_IMAP_HOST
@@ -620,7 +624,7 @@ class OutlookTokenProvider(BaseMailProvider):
         if self.mode in {"graph", "auto"}:
             try:
                 access_token = self._cached_access_token(
-                    mailbox, client_id, refresh_token, OUTLOOK_GRAPH_SCOPE
+                    mailbox, client_id, refresh_token, self.graph_scope
                 )
                 return self._graph_messages(mailbox, access_token)
             except Exception as error:

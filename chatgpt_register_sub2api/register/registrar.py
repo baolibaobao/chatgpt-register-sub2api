@@ -167,6 +167,7 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.current_auth_url = ""
 
     def close(self) -> None:
         self.session.close()
@@ -270,10 +271,48 @@ class PlatformRegistrar:
                 f"platform_authorize HTTP {resp.status_code}{detail}, "
                 f"{_response_debug(resp)}"
             )
+        self.current_auth_url = str(getattr(resp, "url", "") or "").strip()
+        logging.getLogger(__name__).debug(
+            f"[Task {index}] platform authorize url={self.current_auth_url}"
+        )
 
     # ── Step 5: Register user ────────────────────────────────────
 
+    def _switch_to_create_account_password(self, index: int) -> None:
+        """Some Outlook addresses are routed to log-in/password first.
+
+        In the browser, the user can manually switch to the create-account
+        password page and continue the signup flow. Mirror that navigation
+        before calling /api/accounts/user/register.
+        """
+        if "create-account/password" in self.current_auth_url:
+            return
+        if "log-in/password" not in self.current_auth_url and "login/password" not in self.current_auth_url:
+            return
+
+        url = f"{AUTH_BASE}/create-account/password"
+        headers = navigate_headers(self.current_auth_url or f"{AUTH_BASE}/")
+
+        def _do():
+            return request_with_retry(
+                self.session,
+                "get",
+                url,
+                headers=headers,
+                allow_redirects=True,
+                verify=False,
+            )
+
+        resp = self._cf_retry(url, _do, "switch_create_account_password")
+        self.current_auth_url = str(getattr(resp, "url", "") or url).strip()
+        logging.getLogger(__name__).debug(
+            f"[Task {index}] switched to create-account/password: "
+            f"status={resp.status_code}, url={self.current_auth_url[:180]}"
+        )
+
     def _register_user(self, email: str, password: str, index: int) -> None:
+        self._switch_to_create_account_password(index)
+
         url = f"{AUTH_BASE}/api/accounts/user/register"
         headers = json_headers(f"{AUTH_BASE}/create-account/password", self.device_id)
         headers["openai-sentinel-token"] = build_sentinel_token(
@@ -323,6 +362,11 @@ class PlatformRegistrar:
             raise RegistrationError(
                 f"send_otp HTTP {resp.status_code}, {_response_debug(resp)}"
             )
+        logging.getLogger(__name__).debug(
+            f"[Task {index}] send_otp status={resp.status_code}, "
+            f"url={str(getattr(resp, 'url', '') or '')[:180]}, "
+            f"body={(str(getattr(resp, 'text', '') or '')[:220]).replace(chr(10), ' ')}"
+        )
 
     # ── Step 8: Validate OTP ─────────────────────────────────────
 
