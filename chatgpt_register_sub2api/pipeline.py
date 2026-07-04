@@ -25,6 +25,7 @@ from chatgpt_register_sub2api.register.registrar import register_worker
 from chatgpt_register_sub2api.workspace.joiner import join_workspaces
 from chatgpt_register_sub2api.login.login_flow import re_login_for_team_token
 from chatgpt_register_sub2api.export.sub2api import export_sub2api_json
+from chatgpt_register_sub2api.utils.jwt import decode_jwt_payload
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +409,104 @@ def run_export(
     return actual_path
 
 
+def _account_workspace_id(account: dict[str, Any]) -> str:
+    """Return the workspace/account id that the account token currently belongs to."""
+    direct = str(account.get("chatgpt_account_id") or "").strip()
+    if direct:
+        return direct
+    access_token = str(
+        account.get("team_access_token")
+        or account.get("access_token")
+        or ""
+    ).strip()
+    if not access_token:
+        return ""
+    try:
+        payload = decode_jwt_payload(access_token)
+        auth = payload.get("https://api.openai.com/auth", {}) if isinstance(payload, dict) else {}
+        if isinstance(auth, dict):
+            return str(auth.get("chatgpt_account_id") or auth.get("account_id") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _workspace_output_path(
+    config: dict[str, Any],
+    workspace_id: str,
+    batch_ts: str,
+    output_file: Path | None = None,
+) -> Path:
+    suffix = str(workspace_id or "unknown").strip()[:8] or "unknown"
+    if output_file:
+        base = Path(output_file)
+        return base.with_name(f"{base.stem}-workspace-{suffix}{base.suffix or '.json'}")
+    return Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-{suffix}.json"
+
+
+def run_export_by_workspaces(
+    config: dict[str, Any],
+    accounts: list[dict[str, Any]],
+    workspace_ids: list[str],
+    output_file: Path | None = None,
+) -> dict[str, Any]:
+    """Export this batch into one sub2api JSON per configured workspace id.
+
+    The export is conservative: an account is included in a workspace file only
+    when its current token/account metadata says it belongs to that workspace.
+    Joining a workspace successfully is not enough to create a usable token for
+    that workspace.
+    """
+    batch_ts = _timestamp()
+    outputs: list[dict[str, Any]] = []
+    normalized_ids = [str(item or "").strip() for item in workspace_ids if str(item or "").strip()]
+    for workspace_id in normalized_ids:
+        matched = [
+            account
+            for account in accounts
+            if _account_workspace_id(account) == workspace_id
+        ]
+        path = _workspace_output_path(config, workspace_id, batch_ts, output_file)
+        run_export(config, matched, path)
+        outputs.append(
+            {
+                "workspace_id": workspace_id,
+                "output_file": str(path),
+                "account_count": len(matched),
+                "emails": [str(account.get("email") or "") for account in matched],
+            }
+        )
+        logger.info(
+            f"Workspace export: {workspace_id} -> {path} ({len(matched)} accounts)"
+        )
+
+    report_path = Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-report.json"
+    report = {
+        "generated_at": _now(),
+        "note": (
+            "Accounts are exported to a workspace only when the current token "
+            "belongs to that workspace. A successful join_result alone does not "
+            "mean a usable token for that workspace was obtained."
+        ),
+        "outputs": outputs,
+        "batch_accounts": [
+            {
+                "email": str(account.get("email") or ""),
+                "current_workspace_id": _account_workspace_id(account),
+                "joined_workspace_ids": [
+                    str(result.get("workspace_id") or "")
+                    for result in (account.get("join_results") or [])
+                    if isinstance(result, dict) and result.get("ok")
+                ],
+            }
+            for account in accounts
+        ],
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    logger.info(f"Workspace export report written to {report_path}")
+    return {"outputs": outputs, "report_file": str(report_path)}
+
+
 # ── Full pipeline ───────────────────────────────────────────────────
 
 
@@ -457,8 +556,18 @@ def run_full_pipeline(
     refreshed_accounts = run_refresh_tokens(config, joined_accounts)
     save_accounts(af, merge_accounts(load_accounts(af), refreshed_accounts))
 
-    # Stage 4: Export this batch only (do not mix historical accounts)
-    json_output = run_export(config, refreshed_accounts, of)
+    # Stage 4: Export this batch only (do not mix historical accounts).
+    # If multiple workspace IDs are configured, export one JSON per workspace.
+    workspace_ids = [
+        str(item or "").strip()
+        for item in (config.get("workspace", {}).get("ids", []) or [])
+        if str(item or "").strip()
+    ]
+    if len(workspace_ids) > 1:
+        export_result = run_export_by_workspaces(config, refreshed_accounts, workspace_ids, of)
+        json_output = export_result.get("report_file", "")
+    else:
+        json_output = run_export(config, refreshed_accounts, of)
 
     registered = len(new_accounts)
     joined = sum(1 for a in refreshed_accounts if a.get("join_status") == "ok")
@@ -479,4 +588,5 @@ def run_full_pipeline(
         "refreshed": refreshed,
         "exported": exported,
         "accounts_file": str(af),
+        "output_file": str(json_output),
     }
