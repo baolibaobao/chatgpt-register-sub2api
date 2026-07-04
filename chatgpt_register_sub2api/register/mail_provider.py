@@ -1,10 +1,10 @@
-"""Mail provider for ChatGPT registration — Outlook Token Pool only.
+"""Mail providers for ChatGPT registration.
 
 Extracted and simplified from chatgpt2api's mail_provider.py.
-Only the OutlookTokenProvider is included since the user uses Outlook
-token pools exclusively.
 
-Format: email----password----client_id----refresh_token (one per line)
+Supported providers:
+  - outlook_token: email----password----client_id----refresh_token
+  - gmail_imap: Gmail app-password login + variant address pool
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ OUTLOOK_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
 OUTLOOK_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 OUTLOOK_IMAP_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
 OUTLOOK_DEFAULT_IMAP_HOST = "outlook.office365.com"
+GMAIL_DEFAULT_IMAP_HOST = "imap.gmail.com"
+GMAIL_DEFAULT_IMAP_PORT = 993
 
 # ── Pool state tracking ─────────────────────────────────────────────
 
@@ -167,6 +169,26 @@ def parse_outlook_credentials(text: str) -> list[dict[str, str]]:
             }
         )
     return credentials
+
+
+def parse_email_lines(text: str) -> list[str]:
+    """Parse one email address per line, ignoring blank/comment lines."""
+    emails: list[str] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        # Allow users to paste "email----..." accidentally; keep first field.
+        email = line.split("----", 1)[0].strip()
+        if "@" not in email:
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        emails.append(email)
+    return emails
 
 
 # ── Code extraction ─────────────────────────────────────────────────
@@ -675,6 +697,208 @@ class OutlookTokenProvider(BaseMailProvider):
         return None
 
 
+class GmailImapProvider(BaseMailProvider):
+    """Use one Gmail inbox to receive OTPs for Gmail variant addresses.
+
+    Config:
+      login_email: real Gmail account used for IMAP login
+      app_password: Google app password for IMAP login
+      variants: one variant address per line, e.g. user+001@gmail.com
+    """
+
+    name = "gmail_imap"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.label = str(entry.get("label") or self.provider_ref)
+        self.login_email = str(entry.get("login_email") or entry.get("email") or "").strip()
+        self.app_password = str(
+            entry.get("app_password")
+            or entry.get("password")
+            or entry.get("imap_password")
+            or ""
+        ).strip().replace(" ", "")
+        self.imap_host = str(entry.get("imap_host") or GMAIL_DEFAULT_IMAP_HOST).strip()
+        self.imap_port = int(entry.get("imap_port") or GMAIL_DEFAULT_IMAP_PORT)
+        self.message_limit = max(1, int(entry.get("message_limit") or 20))
+        self.match_recipient = bool(entry.get("match_recipient", True))
+        self.pool = parse_email_lines(str(entry.get("variants") or entry.get("mailboxes") or ""))
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.login_email or not self.app_password:
+            raise RuntimeError(
+                f"[{self.label}] Gmail IMAP login_email/app_password missing"
+            )
+        if not self.pool:
+            raise RuntimeError(
+                f"[{self.label}] Gmail variant pool is empty. "
+                "Import one variant email per line."
+            )
+        with _outlook_token_state_lock:
+            store = _load_state()
+            credential = next(
+                (
+                    address
+                    for address in self.pool
+                    if _entry_available(store.get(address.strip().lower()))
+                ),
+                None,
+            )
+            if credential is None:
+                raise RuntimeError(
+                    f"[{self.label}] Gmail variant pool exhausted "
+                    f"({len(self.pool)} total). "
+                    f"All variants used/failed. Import new variants or reset pool state."
+                )
+            store[credential.strip().lower()] = {
+                "state": "in_use",
+                "reason": "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_state(store)
+
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": credential,
+            "label": self.label,
+            "login_email": self.login_email,
+            "app_password": self.app_password,
+            "imap_host": self.imap_host,
+            "imap_port": self.imap_port,
+            "match_recipient": self.match_recipient,
+        }
+
+    def _parse_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
+        message = message_from_bytes(raw, policy=policy.default)
+        try:
+            received = _parse_received_at(
+                parsedate_to_datetime(str(message.get("Date") or ""))
+            )
+        except Exception:
+            received = None
+        plain: list[str] = []
+        html: list[str] = []
+        for part in message.walk() if message.is_multipart() else [message]:
+            if part.get_content_maintype() == "multipart":
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if not payload:
+                continue
+            if part.get_content_type() == "text/html":
+                html.append(str(payload))
+            else:
+                plain.append(str(payload))
+
+        def _decode(value: str | None) -> str:
+            if not value:
+                return ""
+            try:
+                return str(make_header(decode_header(value)))
+            except Exception:
+                return value
+
+        recipients = "\n".join(
+            _decode(str(message.get(header) or ""))
+            for header in ("To", "Delivered-To", "X-Original-To", "Cc")
+            if message.get(header)
+        )
+
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": _decode(str(message.get("Message-ID") or "")),
+            "subject": _decode(str(message.get("Subject") or "")),
+            "sender": _decode(str(message.get("From") or "")),
+            "recipients": recipients,
+            "text_content": "\n".join(plain).strip(),
+            "html_content": "\n".join(html).strip(),
+            "received_at": received,
+            "raw": None,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        login_email = str(mailbox.get("login_email") or self.login_email).strip()
+        app_password = str(mailbox.get("app_password") or self.app_password).strip().replace(" ", "")
+        imap_host = str(mailbox.get("imap_host") or self.imap_host).strip()
+        imap_port = int(mailbox.get("imap_port") or self.imap_port)
+        imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+        try:
+            imap.login(login_email, app_password)
+            status, _ = imap.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("Gmail IMAP select INBOX failed")
+            status, data = imap.uid("search", None, "ALL")
+            if status != "OK" or not data or not data[0]:
+                return []
+            uids = data[0].split()[-self.message_limit :]
+            messages: list[dict[str, Any]] = []
+            for uid in reversed(uids):
+                status, fetched = imap.uid("fetch", uid, "(RFC822)")
+                if status != "OK":
+                    continue
+                raw_payload = next(
+                    (
+                        part[1]
+                        for part in fetched
+                        if isinstance(part, tuple) and isinstance(part[1], bytes)
+                    ),
+                    b"",
+                )
+                if raw_payload:
+                    messages.append(self._parse_message(mailbox, raw_payload))
+            return messages
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+    def _recipient_matches(self, mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
+        if not bool(mailbox.get("match_recipient", self.match_recipient)):
+            return True
+        target = str(mailbox.get("address") or "").strip().lower()
+        if not target:
+            return True
+        recipients = str(message.get("recipients") or "").lower()
+        if recipients:
+            return target in recipients
+        # If the mail server hides recipient headers, do not block forever.
+        return True
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            for message in self.fetch_recent_messages(mailbox):
+                if _message_before_code_boundary(mailbox, message):
+                    continue
+                if not self._recipient_matches(mailbox, message):
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    return code
+                seen_refs.add(ref)
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
+
+
 # ── Public API ─────────────────────────────────────────────────────
 
 
@@ -692,29 +916,39 @@ def _make_config(mail_config: dict) -> dict:
     }
 
 
+def _make_provider(entry: dict, conf: dict) -> BaseMailProvider:
+    provider_type = str(entry.get("type") or "").strip()
+    if provider_type == OutlookTokenProvider.name:
+        return OutlookTokenProvider(entry, conf)
+    if provider_type == GmailImapProvider.name:
+        return GmailImapProvider(entry, conf)
+    raise RuntimeError(f"Unsupported mail provider type: {provider_type}")
+
+
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    """Create a mailbox from the Outlook token pool."""
+    """Create a mailbox from the configured provider pools."""
     providers = (
         mail_config.get("providers")
         if isinstance(mail_config.get("providers"), list)
         else []
     )
-    outlook_entries = [
-        dict(item, provider_ref=f"outlook_token#{i+1}")
+    provider_entries = [
+        dict(item, provider_ref=f"{item.get('type')}#{i+1}")
         for i, item in enumerate(providers)
-        if isinstance(item, dict) and item.get("type") == "outlook_token"
+        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap"}
     ]
-    if not outlook_entries:
+    if not provider_entries:
         raise RuntimeError(
-            "No outlook_token provider found in mail.providers config"
+            "No supported mail provider found in mail.providers config "
+            "(supported: outlook_token, gmail_imap)"
         )
 
     conf = _make_config(mail_config)
     last_error = ""
-    for entry in outlook_entries:
+    for entry in provider_entries:
         if not entry.get("enable", True):
             continue
-        provider = OutlookTokenProvider(entry, conf)
+        provider = _make_provider(entry, conf)
         try:
             mailbox = provider.create_mailbox(username)
             mailbox["_code_not_before"] = datetime.now(timezone.utc)
@@ -723,34 +957,40 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
             last_error = str(error)
         finally:
             provider.close()
-    raise RuntimeError(last_error or "All Outlook providers exhausted")
+    raise RuntimeError(last_error or "All mail providers exhausted")
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
-    """Wait for verification code from Outlook mailbox."""
+    """Wait for verification code from the mailbox's provider."""
     providers = (
         mail_config.get("providers")
         if isinstance(mail_config.get("providers"), list)
         else []
     )
+    provider_entries = [
+        dict(item, provider_ref=f"{item.get('type')}#{i+1}")
+        for i, item in enumerate(providers)
+        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap"}
+    ]
     provider_ref = str(mailbox.get("provider_ref") or "")
-    # Try matching by provider_ref first, then fall back to any outlook_token
+    provider_type = str(mailbox.get("provider") or "").strip()
+    # Try matching by provider_ref first, then fall back to provider type.
     entry = next(
-        (item for item in providers if item.get("provider_ref") == provider_ref),
+        (item for item in provider_entries if item.get("provider_ref") == provider_ref),
         None,
     )
     if entry is None:
         entry = next(
-            (item for item in providers
-             if item.get("type") == "outlook_token" and item.get("enable", True)),
+            (item for item in provider_entries
+             if item.get("type") == provider_type and item.get("enable", True)),
             None,
         )
     if entry is None:
         raise RuntimeError(
-            f"No outlook_token provider found (ref={provider_ref})"
+            f"No mail provider found (provider={provider_type}, ref={provider_ref})"
         )
     conf = _make_config(mail_config)
-    provider = OutlookTokenProvider(entry, conf)
+    provider = _make_provider(entry, conf)
     try:
         return provider.wait_for_code(mailbox)
     finally:
@@ -769,7 +1009,10 @@ def mark_mailbox_result(
     - Token invalid → mark as 'token_invalid'
     - Other failure → mark as 'failed'
     """
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    if str(mailbox.get("provider") or "") not in {
+        OutlookTokenProvider.name,
+        GmailImapProvider.name,
+    }:
         return
     address = str(mailbox.get("address") or "").strip()
     if not address:
@@ -781,6 +1024,7 @@ def mark_mailbox_result(
     if (
         isinstance(error, OutlookTokenError)
         or "OutlookToken" in reason
+        or "Gmail IMAP" in reason
         or "access_token" in reason
     ):
         _set_state(address, "token_invalid", reason[:300])
@@ -790,6 +1034,9 @@ def mark_mailbox_result(
 
 def release_mailbox(mailbox: dict) -> None:
     """Release in_use state back to unused (if registration is abandoned)."""
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+    if str(mailbox.get("provider") or "") not in {
+        OutlookTokenProvider.name,
+        GmailImapProvider.name,
+    }:
         return
     _release_state(str(mailbox.get("address") or ""))

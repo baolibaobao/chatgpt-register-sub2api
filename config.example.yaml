@@ -10,6 +10,19 @@
       mailboxes: |
         user1@outlook.com----password1----client_id_1----refresh_token_1
         user2@hotmail.com----password2----client_id_2----refresh_token_2
+    - type: gmail_imap
+      enable: false
+      label: Gmail Variants
+      login_email: "your-main@gmail.com"
+      app_password: "your-gmail-app-password"
+      imap_host: imap.gmail.com
+      imap_port: 993
+      message_limit: 20
+      match_recipient: true
+      variants: |
+        your-main+001@gmail.com
+        your-main+002@gmail.com
+        your-main+003@gmail.com
   proxy: ""
   request_timeout: 30
   wait_timeout: 45
