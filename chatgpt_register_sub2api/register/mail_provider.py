@@ -979,13 +979,18 @@ class ApiCodeProvider(BaseMailProvider):
             }
             _save_state(store)
 
-        return {
+        mailbox = {
             "provider": self.name,
             "provider_ref": self.provider_ref,
             "address": credential["email"],
             "label": self.label,
             "fetch_url": credential["fetch_url"],
         }
+        try:
+            mailbox["_api_code_before"] = self._fetch_code(mailbox) or ""
+        except Exception:
+            mailbox["_api_code_before"] = ""
+        return mailbox
 
     @staticmethod
     def _extract_code_from_response(data: Any, text: str = "") -> str | None:
@@ -1058,6 +1063,17 @@ class ApiCodeProvider(BaseMailProvider):
             "received_at": datetime.now(timezone.utc),
             "raw": None,
         }
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        """Wait until the API returns a new code, not the pre-send stale code."""
+        before_code = str(mailbox.get("_api_code_before") or "").strip()
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            code = self._fetch_code(mailbox)
+            if code and code != before_code:
+                return code
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
 
 
 # ── Public API ─────────────────────────────────────────────────────
@@ -1158,6 +1174,79 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()
+
+
+def mailbox_for_address(mail_config: dict, address: str) -> dict:
+    """Build a mailbox descriptor for a known address without reserving pool state.
+
+    Used by login/re-login flows where the account already exists and we only
+    need to poll the corresponding mailbox/API for an OTP.
+    """
+    target = str(address or "").strip().lower()
+    providers = (
+        mail_config.get("providers")
+        if isinstance(mail_config.get("providers"), list)
+        else []
+    )
+    for i, item in enumerate(providers):
+        if not isinstance(item, dict) or not item.get("enable", True):
+            continue
+        provider_type = str(item.get("type") or "").strip()
+        provider_ref = f"{provider_type}#{i+1}"
+        if provider_type == OutlookTokenProvider.name:
+            for cred in parse_outlook_credentials(str(item.get("mailboxes") or item.get("pool") or "")):
+                if cred["email"].strip().lower() == target:
+                    return {
+                        "provider": provider_type,
+                        "provider_ref": provider_ref,
+                        "address": cred["email"],
+                        "label": str(item.get("label") or provider_ref),
+                        "client_id": cred["client_id"],
+                        "refresh_token": cred["refresh_token"],
+                    }
+        elif provider_type == GmailImapProvider.name:
+            variants = parse_email_lines(str(item.get("variants") or item.get("mailboxes") or ""))
+            for variant in variants:
+                if variant.strip().lower() == target:
+                    return {
+                        "provider": provider_type,
+                        "provider_ref": provider_ref,
+                        "address": variant,
+                        "label": str(item.get("label") or provider_ref),
+                        "login_email": str(item.get("login_email") or item.get("email") or "").strip(),
+                        "app_password": str(
+                            item.get("app_password")
+                            or item.get("password")
+                            or item.get("imap_password")
+                            or ""
+                        ).strip().replace(" ", ""),
+                        "imap_host": str(item.get("imap_host") or GMAIL_DEFAULT_IMAP_HOST).strip(),
+                        "imap_port": int(item.get("imap_port") or GMAIL_DEFAULT_IMAP_PORT),
+                        "match_recipient": bool(item.get("match_recipient", True)),
+                    }
+        elif provider_type == ApiCodeProvider.name:
+            for cred in parse_api_code_credentials(
+                str(item.get("mailboxes") or item.get("accounts") or item.get("pool") or "")
+            ):
+                if cred["email"].strip().lower() == target:
+                    mailbox = {
+                        "provider": provider_type,
+                        "provider_ref": provider_ref,
+                        "address": cred["email"],
+                        "label": str(item.get("label") or provider_ref),
+                        "fetch_url": cred["fetch_url"],
+                    }
+                    # Record the stale pre-send code to avoid reusing it.
+                    conf = _make_config(mail_config)
+                    provider = ApiCodeProvider(dict(item, provider_ref=provider_ref), conf)
+                    try:
+                        mailbox["_api_code_before"] = provider._fetch_code(mailbox) or ""
+                    except Exception:
+                        mailbox["_api_code_before"] = ""
+                    finally:
+                        provider.close()
+                    return mailbox
+    raise RuntimeError(f"No enabled mail provider entry found for {address}")
 
 
 def mark_mailbox_result(

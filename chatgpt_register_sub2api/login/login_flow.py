@@ -31,7 +31,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from chatgpt_register_sub2api.register.headers import navigate_headers
-from chatgpt_register_sub2api.register.mail_provider import wait_for_code
+from chatgpt_register_sub2api.register.mail_provider import mailbox_for_address, wait_for_code
 from chatgpt_register_sub2api.register.session import (
     create_register_session,
     is_cloudflare_challenge,
@@ -169,7 +169,7 @@ def re_login_for_team_token(
 
         # Step 5: Exchange code for tokens
         tokens = _exchange_login_tokens(
-            session, code_verifier, proxy, flaresolverr_url
+            session, code_verifier, proxy, flaresolverr_url, workspace_id
         )
 
         return {
@@ -254,13 +254,9 @@ def _handle_login_otp(
             f"{getattr(resp, 'status_code', '?')}"
         )
 
-    # Wait for code (we need a temporary mailbox — use the Outlook pool)
-    # Since we already know the email, we can poll for codes on that mailbox
-    code = wait_for_code(mail_config, {
-        "provider": "outlook_token",
-        "provider_ref": "",
-        "address": email,
-    })
+    # Wait for code using the configured provider entry for this address.
+    mailbox = mailbox_for_address(mail_config, email)
+    code = wait_for_code(mail_config, mailbox)
     if not code:
         raise LoginError("Timed out waiting for login OTP code")
 
@@ -368,6 +364,7 @@ def _exchange_login_tokens(
     code_verifier: str,
     proxy: str = "",
     flaresolverr_url: str = "",
+    workspace_id: str = "",
 ) -> dict:
     """Exchange authorization code for tokens after login flow completes.
 
@@ -425,6 +422,12 @@ def _exchange_login_tokens(
         "code_challenge_method": "S256",
         "auth0Client": PLATFORM_AUTH0_CLIENT,
     }
+    if workspace_id:
+        # Best-effort account/workspace hint. OpenAI may ignore unknown params,
+        # so callers must validate the returned access token account id.
+        params["account_id"] = workspace_id
+        params["chatgpt_account_id"] = workspace_id
+        params["workspace_id"] = workspace_id
     auth_url = f"{AUTH_BASE}/api/accounts/authorize?{urlencode(params)}"
 
     resp, error = request_with_retry(
@@ -458,7 +461,7 @@ def _exchange_login_tokens(
         headers=headers,
         json={
             "client_id": PLATFORM_OAUTH_CLIENT_ID,
-            "code_verifier": code_verifier,
+            "code_verifier": code_verifier_final,
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": PLATFORM_OAUTH_REDIRECT_URI,

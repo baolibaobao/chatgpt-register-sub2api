@@ -56,6 +56,29 @@ def save_accounts(path: Path, accounts: list[dict[str, Any]]) -> None:
     tmp.replace(path)
 
 
+def merge_accounts(
+    existing: list[dict[str, Any]],
+    updates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge account records by email, preserving unrelated existing accounts."""
+    merged: list[dict[str, Any]] = []
+    index: dict[str, int] = {}
+    for account in existing:
+        email = str(account.get("email") or "").strip().lower()
+        if email:
+            index[email] = len(merged)
+        merged.append(account)
+    for account in updates:
+        email = str(account.get("email") or "").strip().lower()
+        if email and email in index:
+            merged[index[email]] = account
+        else:
+            if email:
+                index[email] = len(merged)
+            merged.append(account)
+    return merged
+
+
 # ── Pipeline stages ─────────────────────────────────────────────────
 
 
@@ -434,14 +457,13 @@ def run_full_pipeline(
     refreshed_accounts = run_refresh_tokens(config, joined_accounts)
     save_accounts(af, merge_accounts(load_accounts(af), refreshed_accounts))
 
-    # Stage 4: Export (uses plan_type and account_id from check API)
-    all_accounts = load_accounts(af)
-    json_output = run_export(config, all_accounts, of)
+    # Stage 4: Export this batch only (do not mix historical accounts)
+    json_output = run_export(config, refreshed_accounts, of)
 
     registered = len(new_accounts)
     joined = sum(1 for a in refreshed_accounts if a.get("join_status") == "ok")
     refreshed = sum(1 for a in refreshed_accounts if a.get("plan_type") == "k12")
-    exported = len(all_accounts)
+    exported = len(refreshed_accounts)
 
     logger.info("=" * 60)
     logger.info(
