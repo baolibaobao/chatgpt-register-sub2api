@@ -28,6 +28,8 @@
       label: API Code Pool
       mailboxes: |
         user@example.com----https://example.com/api/code/fetch?token=TOKEN&uid=UID
+        # Gmail mother email can be split with scripts/split_mother_email.py:
+        # your-main@gmail.com----https://example.com/api/code/fetch?token=TOKEN&uid=UID
   proxy: ""
   request_timeout: 30
   wait_timeout: 45
