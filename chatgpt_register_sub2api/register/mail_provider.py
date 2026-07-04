@@ -5,6 +5,7 @@ Extracted and simplified from chatgpt2api's mail_provider.py.
 Supported providers:
   - outlook_token: email----password----client_id----refresh_token
   - gmail_imap: Gmail app-password login + variant address pool
+  - api_code: email----https://... fetch URL returning a verification code
 """
 
 from __future__ import annotations
@@ -189,6 +190,30 @@ def parse_email_lines(text: str) -> list[str]:
         seen.add(key)
         emails.append(email)
     return emails
+
+
+def parse_api_code_credentials(text: str) -> list[dict[str, str]]:
+    """Parse API code pool text.
+
+    Format: email----fetch_url (one per line)
+    The fetch URL should return either {"data":{"code":"123456"}},
+    {"code":"123456"}, or a response body containing a 6-digit code.
+    """
+    credentials: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line or line.startswith("#") or "----" not in line:
+            continue
+        email, fetch_url = [str(p).strip() for p in line.split("----", 1)]
+        if "@" not in email or not fetch_url:
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        credentials.append({"email": email, "fetch_url": fetch_url})
+    return credentials
 
 
 # ── Code extraction ─────────────────────────────────────────────────
@@ -899,6 +924,142 @@ class GmailImapProvider(BaseMailProvider):
         return None
 
 
+class ApiCodeProvider(BaseMailProvider):
+    """Use a third-party code-fetch API to receive verification codes.
+
+    Pool entries: email----fetch_url
+    """
+
+    name = "api_code"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.label = str(entry.get("label") or self.provider_ref)
+        self.pool = parse_api_code_credentials(
+            str(entry.get("mailboxes") or entry.get("accounts") or entry.get("pool") or "")
+        )
+        self.session = self._make_session()
+
+    def _make_session(self):
+        proxy = str(self.conf.get("proxy") or "").strip()
+        kwargs = {"impersonate": "chrome", "verify": False}
+        if proxy:
+            kwargs["proxy"] = proxy
+        return requests.Session(**kwargs)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.pool:
+            raise RuntimeError(
+                f"[{self.label}] API code pool is empty. "
+                "Import email----fetch_url lines."
+            )
+        with _outlook_token_state_lock:
+            store = _load_state()
+            credential = next(
+                (
+                    item
+                    for item in self.pool
+                    if _entry_available(store.get(item["email"].strip().lower()))
+                ),
+                None,
+            )
+            if credential is None:
+                raise RuntimeError(
+                    f"[{self.label}] API code pool exhausted "
+                    f"({len(self.pool)} total). "
+                    f"All emails used/failed. Import new emails or reset pool state."
+                )
+            store[credential["email"].strip().lower()] = {
+                "state": "in_use",
+                "reason": "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_state(store)
+
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": credential["email"],
+            "label": self.label,
+            "fetch_url": credential["fetch_url"],
+        }
+
+    @staticmethod
+    def _extract_code_from_response(data: Any, text: str = "") -> str | None:
+        candidates: list[Any] = []
+        if isinstance(data, dict):
+            candidates.extend(
+                [
+                    data.get("code"),
+                    data.get("verification_code"),
+                    data.get("otp"),
+                    data.get("message"),
+                ]
+            )
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                candidates.extend(
+                    [
+                        nested.get("code"),
+                        nested.get("verification_code"),
+                        nested.get("otp"),
+                        nested.get("message"),
+                    ]
+                )
+            elif isinstance(nested, str):
+                candidates.append(nested)
+        elif isinstance(data, str):
+            candidates.append(data)
+        candidates.append(text)
+        for item in candidates:
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(item or ""))
+            if match:
+                return match.group(1)
+        return None
+
+    def _fetch_code(self, mailbox: dict[str, Any]) -> str | None:
+        fetch_url = str(mailbox.get("fetch_url") or "").strip()
+        if not fetch_url:
+            raise RuntimeError("API code mailbox missing fetch_url")
+        resp = self.session.get(
+            fetch_url,
+            headers={"User-Agent": self.conf["user_agent"], "Accept": "application/json,text/plain,*/*"},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        text = ""
+        try:
+            text = str(resp.text or "")
+        except Exception:
+            pass
+        if resp.status_code != 200:
+            raise RuntimeError(f"API code fetch failed: HTTP {resp.status_code}, body={text[:200]}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = text
+        return self._extract_code_from_response(data, text)
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        code = self._fetch_code(mailbox)
+        if not code:
+            return None
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": f"api-code-{mailbox['address']}-{code}",
+            "subject": "Verification code",
+            "sender": "api_code",
+            "text_content": code,
+            "html_content": "",
+            "received_at": datetime.now(timezone.utc),
+            "raw": None,
+        }
+
+
 # ── Public API ─────────────────────────────────────────────────────
 
 
@@ -922,6 +1083,8 @@ def _make_provider(entry: dict, conf: dict) -> BaseMailProvider:
         return OutlookTokenProvider(entry, conf)
     if provider_type == GmailImapProvider.name:
         return GmailImapProvider(entry, conf)
+    if provider_type == ApiCodeProvider.name:
+        return ApiCodeProvider(entry, conf)
     raise RuntimeError(f"Unsupported mail provider type: {provider_type}")
 
 
@@ -935,12 +1098,12 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
     provider_entries = [
         dict(item, provider_ref=f"{item.get('type')}#{i+1}")
         for i, item in enumerate(providers)
-        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap"}
+        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap", "api_code"}
     ]
     if not provider_entries:
         raise RuntimeError(
             "No supported mail provider found in mail.providers config "
-            "(supported: outlook_token, gmail_imap)"
+            "(supported: outlook_token, gmail_imap, api_code)"
         )
 
     conf = _make_config(mail_config)
@@ -970,7 +1133,7 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
     provider_entries = [
         dict(item, provider_ref=f"{item.get('type')}#{i+1}")
         for i, item in enumerate(providers)
-        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap"}
+        if isinstance(item, dict) and item.get("type") in {"outlook_token", "gmail_imap", "api_code"}
     ]
     provider_ref = str(mailbox.get("provider_ref") or "")
     provider_type = str(mailbox.get("provider") or "").strip()
@@ -1012,6 +1175,7 @@ def mark_mailbox_result(
     if str(mailbox.get("provider") or "") not in {
         OutlookTokenProvider.name,
         GmailImapProvider.name,
+        ApiCodeProvider.name,
     }:
         return
     address = str(mailbox.get("address") or "").strip()
@@ -1037,6 +1201,7 @@ def release_mailbox(mailbox: dict) -> None:
     if str(mailbox.get("provider") or "") not in {
         OutlookTokenProvider.name,
         GmailImapProvider.name,
+        ApiCodeProvider.name,
     }:
         return
     _release_state(str(mailbox.get("address") or ""))

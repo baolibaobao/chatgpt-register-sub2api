@@ -23,6 +23,11 @@
         your-main+001@gmail.com
         your-main+002@gmail.com
         your-main+003@gmail.com
+    - type: api_code
+      enable: false
+      label: API Code Pool
+      mailboxes: |
+        user@example.com----https://example.com/api/code/fetch?token=TOKEN&uid=UID
   proxy: ""
   request_timeout: 30
   wait_timeout: 45
