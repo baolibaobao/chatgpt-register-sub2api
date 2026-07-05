@@ -994,6 +994,52 @@ class ApiCodeProvider(BaseMailProvider):
 
     @staticmethod
     def _extract_code_from_response(data: Any, text: str = "") -> str | None:
+        structured_codes: list[tuple[float, int, str]] = []
+        seq = 0
+
+        def maybe_code(value: Any) -> str | None:
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value or ""))
+            return match.group(1) if match else None
+
+        def received_sort_key(value: Any) -> float:
+            parsed = _parse_received_at(value)
+            return parsed.timestamp() if parsed else 0.0
+
+        def walk(obj: Any) -> None:
+            nonlocal seq
+            if isinstance(obj, dict):
+                code = (
+                    maybe_code(obj.get("code"))
+                    or maybe_code(obj.get("verification_code"))
+                    or maybe_code(obj.get("otp"))
+                )
+                if code:
+                    structured_codes.append(
+                        (
+                            received_sort_key(
+                                obj.get("receivedAt")
+                                or obj.get("received_at")
+                                or obj.get("smsTime")
+                                or obj.get("time")
+                                or obj.get("createdAt")
+                            ),
+                            seq,
+                            code,
+                        )
+                    )
+                    seq += 1
+                for value in obj.values():
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    walk(value)
+
+        walk(data)
+        if structured_codes:
+            structured_codes.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return structured_codes[0][2]
+
         candidates: list[Any] = []
         if isinstance(data, dict):
             candidates.extend(
@@ -1020,9 +1066,9 @@ class ApiCodeProvider(BaseMailProvider):
             candidates.append(data)
         candidates.append(text)
         for item in candidates:
-            match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(item or ""))
-            if match:
-                return match.group(1)
+            code = maybe_code(item)
+            if code:
+                return code
         return None
 
     def _fetch_code(self, mailbox: dict[str, Any]) -> str | None:

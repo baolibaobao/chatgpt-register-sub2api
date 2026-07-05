@@ -9,6 +9,7 @@ __pycache__/
 !.env.example
 
 config.yaml
+config.yaml.bak-*
 registered_accounts.json
 sub2api-*.json
 sub2api_bundle.json
