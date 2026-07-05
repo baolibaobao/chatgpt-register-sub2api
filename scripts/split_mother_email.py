@@ -6,6 +6,7 @@ import shutil
 import string
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
 
@@ -58,6 +59,35 @@ def build_variants(mother: str, count: int, existing: set[str], suffix_len: int)
     return variants
 
 
+def fetch_url_for_variant(fetch_url: str, email: str) -> str:
+    """Return a variant-aware fetch URL.
+
+    Some code APIs use one static session URL for all Gmail aliases. Others put
+    the target address in a query parameter, for example ``?address=a@gmail.com``.
+    If an address/email/mailbox query parameter exists, rewrite it to the alias
+    being generated; otherwise keep the original URL unchanged.
+    """
+    try:
+        parts = urlsplit(str(fetch_url or "").strip())
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+    except Exception:
+        return fetch_url
+
+    changed = False
+    rewritten: list[tuple[str, str]] = []
+    for key, value in pairs:
+        if key.lower() in {"address", "email", "mailbox", "mail"} and "@" in value:
+            rewritten.append((key, email))
+            changed = True
+        else:
+            rewritten.append((key, value))
+    if not changed:
+        return fetch_url
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(rewritten), parts.fragment)
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Split api_code mother Gmail addresses into plus-address variants.")
     parser.add_argument("--config", "-c", default="config.yaml", help="config.yaml path")
@@ -70,6 +100,11 @@ def main() -> int:
     parser.add_argument("--email", action="append", default=[], help="mother email to split; repeatable. Default: all non-plus api_code emails")
     parser.add_argument("--suffix-len", type=int, default=6, help="random suffix length")
     parser.add_argument("--remove-mother", action="store_true", help="remove mother email line after splitting")
+    parser.add_argument(
+        "--rewrite-address-param",
+        action="store_true",
+        help="rewrite address/email/mailbox query parameters in fetch URLs to each generated alias",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print changes without writing config")
     args = parser.parse_args()
 
@@ -137,7 +172,12 @@ def main() -> int:
             variants = build_variants(mother, add_count, existing, args.suffix_len)
             url = url_by_mother[mother.lower()]
             for variant in variants:
-                new_rows.append((variant, url))
+                variant_url = (
+                    fetch_url_for_variant(url, variant)
+                    if args.rewrite_address_param
+                    else url
+                )
+                new_rows.append((variant, variant_url))
                 total_added += 1
             print(f"{mother} -> {len(variants)} variants")
             for variant in variants:
