@@ -457,9 +457,13 @@ def _account_for_workspace_export(
     exported chatgpt_account_id tells sub2api which joined workspace to use.
     """
     export = dict(account)
+    email = str(export.get("email") or "").strip()
+    suffix = str(workspace_id or "unknown").strip()[:8] or "unknown"
     export["chatgpt_account_id"] = workspace_id
     export["plan_type"] = str(export.get("plan_type") or "k12")
     export["source_type"] = "joined_workspace"
+    export["export_workspace_id"] = workspace_id
+    export["sub2api_name"] = f"{email}-workspace-{suffix}" if email else f"workspace-{suffix}"
     return export
 
 
@@ -476,6 +480,17 @@ def _workspace_output_path(
     return Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-{suffix}.json"
 
 
+def _final_output_path(
+    config: dict[str, Any],
+    batch_ts: str,
+    output_file: Path | None = None,
+) -> Path:
+    if output_file:
+        base = Path(output_file)
+        return base.with_name(f"{base.stem}-final{base.suffix or '.json'}")
+    return Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-final.json"
+
+
 def run_export_by_workspaces(
     config: dict[str, Any],
     accounts: list[dict[str, Any]],
@@ -490,6 +505,7 @@ def run_export_by_workspaces(
     """
     batch_ts = _timestamp()
     outputs: list[dict[str, Any]] = []
+    final_accounts: list[dict[str, Any]] = []
     normalized_ids = [str(item or "").strip() for item in workspace_ids if str(item or "").strip()]
     for workspace_id in normalized_ids:
         matched = [
@@ -501,6 +517,7 @@ def run_export_by_workspaces(
                 and _account_workspace_id(account) == workspace_id
             )
         ]
+        final_accounts.extend(matched)
         path = _workspace_output_path(config, workspace_id, batch_ts, output_file)
         run_export(config, matched, path)
         outputs.append(
@@ -515,14 +532,24 @@ def run_export_by_workspaces(
             f"Workspace export: {workspace_id} -> {path} ({len(matched)} accounts)"
         )
 
+    final_path = _final_output_path(config, batch_ts, output_file)
+    run_export(config, final_accounts, final_path)
+    logger.info(
+        f"Final merged export: {final_path} ({len(final_accounts)} account/workspace rows)"
+    )
+
     report_path = Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-report.json"
     report = {
         "generated_at": _now(),
         "note": (
             "Accounts are expanded by successful join_results: each registered "
             "account is exported once for every joined workspace, with "
-            "chatgpt_account_id set to that workspace id."
+            "chatgpt_account_id set to that workspace id. Per-workspace JSON "
+            "files are kept, and final_output_file merges all workspace rows "
+            "for one-shot sub2api import."
         ),
+        "final_output_file": str(final_path),
+        "final_account_count": len(final_accounts),
         "outputs": outputs,
         "batch_accounts": [
             {
@@ -535,7 +562,12 @@ def run_export_by_workspaces(
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     logger.info(f"Workspace export report written to {report_path}")
-    return {"outputs": outputs, "report_file": str(report_path)}
+    return {
+        "outputs": outputs,
+        "final_file": str(final_path),
+        "final_account_count": len(final_accounts),
+        "report_file": str(report_path),
+    }
 
 
 # ── Full pipeline ───────────────────────────────────────────────────
@@ -596,7 +628,7 @@ def run_full_pipeline(
     ]
     if len(workspace_ids) > 1:
         export_result = run_export_by_workspaces(config, refreshed_accounts, workspace_ids, of)
-        json_output = export_result.get("report_file", "")
+        json_output = export_result.get("final_file") or export_result.get("report_file", "")
     else:
         json_output = run_export(config, refreshed_accounts, of)
 

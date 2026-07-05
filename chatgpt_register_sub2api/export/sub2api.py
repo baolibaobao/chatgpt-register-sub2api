@@ -118,10 +118,11 @@ def build_account_entry(
 ) -> dict[str, Any]:
     """Build a single sub2api account entry from an account record."""
     email = str(account.get("email") or "").strip()
+    name = str(account.get("sub2api_name") or email).strip() or email
     source = str(account.get("source_type") or account.get("source") or "registration")
 
     return {
-        "name": email,
+        "name": name,
         "platform": "openai",
         "type": "oauth",
         "credentials": build_credentials(account),

@@ -191,6 +191,8 @@ def cmd_run(args) -> int:
     print(f"  K12 Refreshed: {summary['refreshed']}")
     print(f"  Exported:    {summary['exported']}")
     print(f"  Accounts:    {summary['accounts_file']}")
+    if summary.get("output_file"):
+        print(f"  Final JSON:   {summary['output_file']}")
 
     return 0 if summary["registered"] > 0 else 1
 
