@@ -467,17 +467,13 @@ def _account_for_workspace_export(
     return export
 
 
-def _workspace_output_path(
+def _export_output_dir(
     config: dict[str, Any],
-    workspace_id: str,
-    batch_ts: str,
     output_file: Path | None = None,
 ) -> Path:
-    suffix = str(workspace_id or "unknown").strip()[:8] or "unknown"
     if output_file:
-        base = Path(output_file)
-        return base.with_name(f"{base.stem}-workspace-{suffix}{base.suffix or '.json'}")
-    return Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-{suffix}.json"
+        return Path(output_file).parent
+    return Path(config.get("_config_dir", ".")) / "exports"
 
 
 def _final_output_path(
@@ -488,7 +484,7 @@ def _final_output_path(
     if output_file:
         base = Path(output_file)
         return base.with_name(f"{base.stem}-final{base.suffix or '.json'}")
-    return Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-final.json"
+    return _export_output_dir(config, output_file) / f"sub2api-{batch_ts}-final.json"
 
 
 def run_export_by_workspaces(
@@ -497,11 +493,10 @@ def run_export_by_workspaces(
     workspace_ids: list[str],
     output_file: Path | None = None,
 ) -> dict[str, Any]:
-    """Export this batch into one sub2api JSON per configured workspace id.
+    """Export this batch into one final sub2api JSON plus a workspace report.
 
-    An account is included in every workspace file where join_results says that
-    account joined successfully.  This expands N registered accounts × M joined
-    workspaces into N×M usable sub2api rows across the workspace exports.
+    Successful join_results expand N registered accounts x M joined workspaces
+    into N x M usable sub2api rows in the final merged export.
     """
     batch_ts = _timestamp()
     outputs: list[dict[str, Any]] = []
@@ -518,19 +513,14 @@ def run_export_by_workspaces(
             )
         ]
         final_accounts.extend(matched)
-        path = _workspace_output_path(config, workspace_id, batch_ts, output_file)
-        run_export(config, matched, path)
         outputs.append(
             {
                 "workspace_id": workspace_id,
-                "output_file": str(path),
                 "account_count": len(matched),
                 "emails": [str(account.get("email") or "") for account in matched],
             }
         )
-        logger.info(
-            f"Workspace export: {workspace_id} -> {path} ({len(matched)} accounts)"
-        )
+        logger.info(f"Workspace rows: {workspace_id} ({len(matched)} accounts)")
 
     final_path = _final_output_path(config, batch_ts, output_file)
     run_export(config, final_accounts, final_path)
@@ -538,15 +528,15 @@ def run_export_by_workspaces(
         f"Final merged export: {final_path} ({len(final_accounts)} account/workspace rows)"
     )
 
-    report_path = Path(config.get("_config_dir", ".")) / f"sub2api-{batch_ts}-workspace-report.json"
+    report_path = _export_output_dir(config, output_file) / f"sub2api-{batch_ts}-workspace-report.json"
     report = {
         "generated_at": _now(),
         "note": (
             "Accounts are expanded by successful join_results: each registered "
             "account is exported once for every joined workspace, with "
-            "chatgpt_account_id set to that workspace id. Per-workspace JSON "
-            "files are kept, and final_output_file merges all workspace rows "
-            "for one-shot sub2api import."
+            "chatgpt_account_id set to that workspace id. Only final_output_file "
+            "is written for one-shot sub2api import; outputs below are counts "
+            "per workspace for auditing."
         ),
         "final_output_file": str(final_path),
         "final_account_count": len(final_accounts),
