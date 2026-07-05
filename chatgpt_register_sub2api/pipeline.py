@@ -431,6 +431,38 @@ def _account_workspace_id(account: dict[str, Any]) -> str:
     return ""
 
 
+def _joined_workspace_ids(account: dict[str, Any]) -> list[str]:
+    """Return workspace ids that were successfully joined by this account."""
+    joined: list[str] = []
+    seen: set[str] = set()
+    for result in account.get("join_results") or []:
+        if not isinstance(result, dict) or not result.get("ok"):
+            continue
+        workspace_id = str(result.get("workspace_id") or "").strip()
+        if not workspace_id or workspace_id in seen:
+            continue
+        joined.append(workspace_id)
+        seen.add(workspace_id)
+    return joined
+
+
+def _account_for_workspace_export(
+    account: dict[str, Any],
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Copy an account and scope its exported metadata to a joined workspace.
+
+    Joining multiple K12 workspaces creates one usable sub2api row per
+    account/workspace pair.  The OAuth tokens stay the account's tokens; the
+    exported chatgpt_account_id tells sub2api which joined workspace to use.
+    """
+    export = dict(account)
+    export["chatgpt_account_id"] = workspace_id
+    export["plan_type"] = str(export.get("plan_type") or "k12")
+    export["source_type"] = "joined_workspace"
+    return export
+
+
 def _workspace_output_path(
     config: dict[str, Any],
     workspace_id: str,
@@ -452,19 +484,22 @@ def run_export_by_workspaces(
 ) -> dict[str, Any]:
     """Export this batch into one sub2api JSON per configured workspace id.
 
-    The export is conservative: an account is included in a workspace file only
-    when its current token/account metadata says it belongs to that workspace.
-    Joining a workspace successfully is not enough to create a usable token for
-    that workspace.
+    An account is included in every workspace file where join_results says that
+    account joined successfully.  This expands N registered accounts × M joined
+    workspaces into N×M usable sub2api rows across the workspace exports.
     """
     batch_ts = _timestamp()
     outputs: list[dict[str, Any]] = []
     normalized_ids = [str(item or "").strip() for item in workspace_ids if str(item or "").strip()]
     for workspace_id in normalized_ids:
         matched = [
-            account
+            _account_for_workspace_export(account, workspace_id)
             for account in accounts
-            if _account_workspace_id(account) == workspace_id
+            if workspace_id in _joined_workspace_ids(account)
+            or (
+                not account.get("join_results")
+                and _account_workspace_id(account) == workspace_id
+            )
         ]
         path = _workspace_output_path(config, workspace_id, batch_ts, output_file)
         run_export(config, matched, path)
@@ -484,20 +519,16 @@ def run_export_by_workspaces(
     report = {
         "generated_at": _now(),
         "note": (
-            "Accounts are exported to a workspace only when the current token "
-            "belongs to that workspace. A successful join_result alone does not "
-            "mean a usable token for that workspace was obtained."
+            "Accounts are expanded by successful join_results: each registered "
+            "account is exported once for every joined workspace, with "
+            "chatgpt_account_id set to that workspace id."
         ),
         "outputs": outputs,
         "batch_accounts": [
             {
                 "email": str(account.get("email") or ""),
                 "current_workspace_id": _account_workspace_id(account),
-                "joined_workspace_ids": [
-                    str(result.get("workspace_id") or "")
-                    for result in (account.get("join_results") or [])
-                    if isinstance(result, dict) and result.get("ok")
-                ],
+                "joined_workspace_ids": _joined_workspace_ids(account),
             }
             for account in accounts
         ],

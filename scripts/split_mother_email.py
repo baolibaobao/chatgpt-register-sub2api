@@ -62,6 +62,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Split api_code mother Gmail addresses into plus-address variants.")
     parser.add_argument("--config", "-c", default="config.yaml", help="config.yaml path")
     parser.add_argument("--count", "-n", type=int, default=4, help="variants to create per mother email")
+    parser.add_argument(
+        "--target-count",
+        action="store_true",
+        help="treat --count as the desired total number of plus variants per mother; only add missing variants",
+    )
     parser.add_argument("--email", action="append", default=[], help="mother email to split; repeatable. Default: all non-plus api_code emails")
     parser.add_argument("--suffix-len", type=int, default=6, help="random suffix length")
     parser.add_argument("--remove-mother", action="store_true", help="remove mother email line after splitting")
@@ -115,7 +120,21 @@ def main() -> int:
 
         new_rows = list(rows)
         for mother in mother_order:
-            variants = build_variants(mother, args.count, existing, args.suffix_len)
+            mother_key = mother.lower()
+            add_count = args.count
+            if args.target_count:
+                existing_variant_count = sum(
+                    1
+                    for email, _url in new_rows
+                    if canonical_mother(email).lower() == mother_key
+                    and email.strip().lower() != mother_key
+                )
+                add_count = max(0, args.count - existing_variant_count)
+            if add_count <= 0:
+                print(f"{mother} -> already has {args.count} variants; nothing to add")
+                continue
+
+            variants = build_variants(mother, add_count, existing, args.suffix_len)
             url = url_by_mother[mother.lower()]
             for variant in variants:
                 new_rows.append((variant, url))
