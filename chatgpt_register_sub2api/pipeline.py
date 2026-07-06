@@ -481,7 +481,7 @@ def _account_for_workspace_export(
     export["plan_type"] = str(export.get("plan_type") or "k12")
     export["source_type"] = "joined_workspace"
     export["export_workspace_id"] = workspace_id
-    export["sub2api_name"] = f"{email}-workspace-{suffix}" if email else f"workspace-{suffix}"
+    export["sub2api_name"] = f"workspace-{suffix}-{email}" if email else f"workspace-{suffix}"
     return export
 
 
@@ -496,7 +496,7 @@ def _account_for_personal_plus_export(account: dict[str, Any]) -> dict[str, Any]
         export["chatgpt_account_id"] = personal_account_id
     export["plan_type"] = str(export.get("personal_plan_type") or "plus")
     export["source_type"] = "personal_plus"
-    export["sub2api_name"] = f"{email}-personal-plus" if email else "personal-plus"
+    export["sub2api_name"] = f"plus-{email}" if email else "plus"
     return export
 
 
