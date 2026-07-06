@@ -38,6 +38,12 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _subscription_is_plus(plan_type: str = "", subscription_plan: str = "") -> bool:
+    """Return True when an account-level entitlement looks like Plus."""
+    text = f"{plan_type} {subscription_plan}".lower()
+    return "plus" in text
+
+
 def load_accounts(path: Path) -> list[dict[str, Any]]:
     """Load registered accounts from JSON file."""
     if not path.exists():
@@ -348,10 +354,14 @@ def run_refresh_tokens(
                 if resp.status_code == 200:
                     data = resp.json()
                     accts = data.get("accounts", {})
-                    default = accts.get("default", {}).get("account", {})
+                    default_entry = accts.get("default", {})
+                    default = default_entry.get("account", {})
+                    entitlement = default_entry.get("entitlement", {})
                     plan = default.get("plan_type", "")
                     acct_id = default.get("account_id", "")
                     role = default.get("account_user_role", "")
+                    subscription_plan = str(entitlement.get("subscription_plan") or "")
+                    personal_is_plus = _subscription_is_plus(plan, subscription_plan)
 
                     if plan:
                         account["plan_type"] = plan
@@ -359,9 +369,17 @@ def run_refresh_tokens(
                         account["chatgpt_account_id"] = acct_id
                     if role:
                         account["account_user_role"] = role
+                    account["personal_plan_type"] = plan
+                    account["personal_subscription_plan"] = subscription_plan
+                    account["personal_has_active_subscription"] = bool(
+                        entitlement.get("has_active_subscription")
+                    )
+                    account["personal_account_id"] = acct_id
+                    account["personal_is_plus"] = personal_is_plus
 
                     logger.info(
-                        f"[{email}] Check API: plan={plan} account_id={acct_id[:30] if acct_id else '?'} role={role}"
+                        f"[{email}] Check API: plan={plan} subscription={subscription_plan or '?'} "
+                        f"personal_plus={personal_is_plus} account_id={acct_id[:30] if acct_id else '?'} role={role}"
                     )
                 else:
                     logger.warning(f"[{email}] Check API failed: HTTP {resp.status_code}")
@@ -467,6 +485,21 @@ def _account_for_workspace_export(
     return export
 
 
+def _account_for_personal_plus_export(account: dict[str, Any]) -> dict[str, Any]:
+    """Copy an account for its own Plus entitlement export."""
+    export = dict(account)
+    email = str(export.get("email") or "").strip()
+    personal_account_id = str(
+        export.get("personal_account_id") or export.get("chatgpt_account_id") or ""
+    ).strip()
+    if personal_account_id:
+        export["chatgpt_account_id"] = personal_account_id
+    export["plan_type"] = str(export.get("personal_plan_type") or "plus")
+    export["source_type"] = "personal_plus"
+    export["sub2api_name"] = f"{email}-personal-plus" if email else "personal-plus"
+    return export
+
+
 def _export_output_dir(
     config: dict[str, Any],
     output_file: Path | None = None,
@@ -522,6 +555,14 @@ def run_export_by_workspaces(
         )
         logger.info(f"Workspace rows: {workspace_id} ({len(matched)} accounts)")
 
+    personal_plus_accounts = [
+        _account_for_personal_plus_export(account)
+        for account in accounts
+        if bool(account.get("personal_is_plus"))
+    ]
+    final_accounts.extend(personal_plus_accounts)
+    logger.info(f"Personal Plus rows: {len(personal_plus_accounts)} accounts")
+
     final_path = _final_output_path(config, batch_ts, output_file)
     run_export(config, final_accounts, final_path)
     logger.info(
@@ -540,11 +581,22 @@ def run_export_by_workspaces(
         ),
         "final_output_file": str(final_path),
         "final_account_count": len(final_accounts),
+        "personal_plus": {
+            "account_count": len(personal_plus_accounts),
+            "emails": [
+                str(account.get("email") or "") for account in personal_plus_accounts
+            ],
+        },
         "outputs": outputs,
         "batch_accounts": [
             {
                 "email": str(account.get("email") or ""),
                 "current_workspace_id": _account_workspace_id(account),
+                "personal_is_plus": bool(account.get("personal_is_plus")),
+                "personal_plan_type": str(account.get("personal_plan_type") or ""),
+                "personal_subscription_plan": str(
+                    account.get("personal_subscription_plan") or ""
+                ),
                 "joined_workspace_ids": _joined_workspace_ids(account),
             }
             for account in accounts
